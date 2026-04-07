@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
@@ -17,59 +20,110 @@ from tools import calculate_budget, search_flights, search_hotels
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-SYSTEM_PROMPT = (BASE_DIR / "system_prompt.txt").read_text(encoding="utf-8")
+DEFAULT_MODEL = os.getenv("TRAVELBUDDY_MODEL", "gpt-4o-mini")
+GRAPH_RECURSION_LIMIT = int(os.getenv("TRAVELBUDDY_RECURSION_LIMIT", "8"))
+TRACE_ENABLED = os.getenv("TRAVELBUDDY_DEBUG", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+LOGGER = logging.getLogger("travelbuddy")
+TOOLS_LIST = (search_flights, search_hotels, calculate_budget)
 
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 
-tools_list = [search_flights, search_hotels, calculate_budget]
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-llm_with_tools = llm.bind_tools(tools_list)
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO if TRACE_ENABLED else logging.WARNING,
+        format="%(message)s",
+    )
 
 
-def agent_node(state: AgentState) -> AgentState:
-    messages = state["messages"]
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [SystemMessage(content=SYSTEM_PROMPT), *messages]
-
-    response = llm_with_tools.invoke(messages)
-
-    if response.tool_calls:
-        for tool_call in response.tool_calls:
-            print(f"[Gọi tool: {tool_call['name']}]({tool_call['args']})")
-    else:
-        print("[Trả lời trực tiếp]")
-
-    return {"messages": [response]}
+@lru_cache(maxsize=1)
+def load_system_prompt() -> str:
+    prompt_path = BASE_DIR / "system_prompt.txt"
+    if not prompt_path.exists():
+        raise RuntimeError(f"Không tìm thấy file system prompt: {prompt_path}")
+    return prompt_path.read_text(encoding="utf-8")
 
 
-builder = StateGraph(AgentState)
-builder.add_node("agent", agent_node)
-builder.add_node("tools", ToolNode(tools_list))
+def ensure_system_message(messages: list[BaseMessage]) -> list[BaseMessage]:
+    if messages and isinstance(messages[0], SystemMessage):
+        return messages
+    return [SystemMessage(content=load_system_prompt()), *messages]
 
-builder.add_edge(START, "agent")
-builder.add_conditional_edges(
-    "agent",
-    tools_condition,
-    {
-        "tools": "tools",
-        END: END,
-    },
-)
-builder.add_edge("tools", "agent")
 
-graph = builder.compile()
+def create_llm() -> ChatOpenAI:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Thiếu OPENAI_API_KEY trong file .env hoặc biến môi trường.")
+    return ChatOpenAI(model=DEFAULT_MODEL, temperature=0)
+
+
+def log_agent_trace(tool_calls: list[dict[str, object]]) -> None:
+    if not tool_calls:
+        LOGGER.info("[Trả lời trực tiếp]")
+        return
+
+    for tool_call in tool_calls:
+        LOGGER.info("[Gọi tool: %s](%s)", tool_call["name"], tool_call["args"])
+
+
+def create_agent_node():
+    llm_with_tools = create_llm().bind_tools(TOOLS_LIST)
+
+    def agent_node(state: AgentState) -> AgentState:
+        response = llm_with_tools.invoke(state["messages"])
+        log_agent_trace(getattr(response, "tool_calls", []))
+        return {"messages": [response]}
+
+    return agent_node
+
+
+def build_graph():
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", create_agent_node())
+    builder.add_node("tools", ToolNode(list(TOOLS_LIST)))
+
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges(
+        "agent",
+        tools_condition,
+        {
+            "tools": "tools",
+            END: END,
+        },
+    )
+    builder.add_edge("tools", "agent")
+    return builder.compile()
+
+
+@lru_cache(maxsize=1)
+def get_graph():
+    return build_graph()
 
 
 def invoke_agent(user_input: str, history: list[BaseMessage] | None = None) -> list[BaseMessage]:
-    history = history or []
-    result = graph.invoke({"messages": [*history, HumanMessage(content=user_input)]})
+    cleaned_input = user_input.strip()
+    if not cleaned_input:
+        raise ValueError("user_input không được để trống.")
+
+    history = list(history or [])
+    messages = ensure_system_message([*history, HumanMessage(content=cleaned_input)])
+    result = get_graph().invoke(
+        {"messages": messages},
+        config={"recursion_limit": GRAPH_RECURSION_LIMIT},
+    )
     return result["messages"]
 
 
-if __name__ == "__main__":
+def main() -> None:
+    configure_logging()
+
     print("=" * 60)
     print("TravelBuddy — Trợ lý Du lịch Thông minh")
     print("Gõ 'quit' để thoát")
@@ -85,7 +139,20 @@ if __name__ == "__main__":
             continue
 
         print("\n[TravelBuddy đang suy nghĩ...]")
-        updated_messages = invoke_agent(user_input, conversation)
+        try:
+            updated_messages = invoke_agent(user_input, conversation)
+        except Exception as exc:
+            LOGGER.exception("Lỗi khi chạy agent: %s", exc)
+            print(
+                "\nTravelBuddy: Tôi đang gặp lỗi khi xử lý yêu cầu này. "
+                "Vui lòng kiểm tra cấu hình hoặc thử lại."
+            )
+            continue
+
         conversation = updated_messages
         final_message = updated_messages[-1]
         print(f"\nTravelBuddy: {final_message.content}")
+
+
+if __name__ == "__main__":
+    main()
